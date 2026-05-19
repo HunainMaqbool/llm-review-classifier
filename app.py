@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import anthropic
-from anthropic import AuthenticationError, RateLimitError, APIError
+from anthropic import AuthenticationError, RateLimitError, APIError, APIConnectionError
 import json
 import time
 import io
@@ -199,6 +199,8 @@ def classify_review(
         return {"error": f"RateLimitError after retries: {str(e)}"}
     except APIError as e:
         return {"error": f"APIError {e.status_code}: {e.message}"}
+    except APIConnectionError as e:
+        return {"error": f"APIConnectionError: {str(e)}"}
     except json.JSONDecodeError:
         return {"error": f"JSON parse failed: {raw[:200]}"}
 

@@ -2,7 +2,7 @@
 import anthropic
 # Import specific error types so each failure can be handled differently
 # (wrong key = crash immediately, rate limit = retry, API error = log and skip)
-from anthropic import AuthenticationError, RateLimitError, APIError
+from anthropic import AuthenticationError, RateLimitError, APIError, APIConnectionError
 
 # pandas reads the CSV of 800 reviews and writes the classified output CSV
 import pandas as pd
@@ -10,6 +10,8 @@ import pandas as pd
 import json
 # os checks whether the checkpoint file exists so we can resume mid-run
 import os
+# sys reads simple command-line values: input file, output file, checkpoint file, optional row limit
+import sys
 # time.sleep adds a small delay between API calls to stay within rate limits
 import time
 # tqdm draws the progress bar so we can see how many reviews are left
@@ -27,6 +29,7 @@ MODEL            = "claude-haiku-4-5-20251001" # Haiku is fast and cheap — eno
 MAX_TOKENS       = 400                         # JSON response is ~200 tokens; 400 gives room for verbose reasoning
 TEMPERATURE      = 0.0   # deterministic output for classification tasks
 MAX_RETRIES      = 3     # SDK retries with exponential backoff on transient errors
+REQUIRED_COLUMNS = {"review_id", "app_name", "score", "content"}
 # ──────────────────────────────────────────────────────────────────────────────
 
 # max_retries tells the SDK to automatically retry failed requests (with backoff)
@@ -244,6 +247,11 @@ def classify_review(review_text: str, app_name: str, score: str) -> dict[str, An
         print(f"\nAPI ERROR {e.status_code}: {e.message}")
         return {"error": f"APIError {e.status_code}: {e.message}"}
 
+    except APIConnectionError as e:
+        # Network/DNS failure — mark this row so the run can continue or be retried later.
+        print(f"\nAPI CONNECTION ERROR: {e}")
+        return {"error": f"APIConnectionError: {str(e)}"}
+
     except json.JSONDecodeError as e:
         # Claude returned text that isn't valid JSON — happens on very short or garbled responses.
         # Truncate raw to 200 chars so the error log stays readable in the terminal.
@@ -251,29 +259,66 @@ def classify_review(review_text: str, app_name: str, score: str) -> dict[str, An
         return {"error": f"JSON parse failed: {raw[:200]}"}
 
 
+def get_run_options() -> tuple[str, str, str, int | None]:
+    """Read optional command-line values without adding extra dependencies."""
+    input_file = sys.argv[1] if len(sys.argv) > 1 else INPUT_FILE
+    output_file = sys.argv[2] if len(sys.argv) > 2 else OUTPUT_FILE
+    checkpoint_file = sys.argv[3] if len(sys.argv) > 3 else CHECKPOINT_FILE
+    row_limit = int(sys.argv[4]) if len(sys.argv) > 4 else None
+    return input_file, output_file, checkpoint_file, row_limit
+
+
+def review_keys(df: pd.DataFrame) -> pd.Series:
+    """Build the real row identity: app name plus review id."""
+    return pd.Series(
+        list(zip(df["app_name"].astype(str), df["review_id"].astype(str))),
+        index=df.index,
+    )
+
+
+def count_real_values(series: pd.Series) -> int:
+    """Count cells that have real text, not blank strings or CSV NaN values."""
+    return int(series.fillna("").astype(str).str.strip().ne("").sum())
+
+
 def main() -> None:
     # ── Phase 1: Load the raw reviews CSV produced by Task 1 ──────────────────
-    print(f"Loading reviews from {INPUT_FILE}...")
-    df = pd.read_csv(INPUT_FILE)
+    input_file, output_file, checkpoint_file, row_limit = get_run_options()
+
+    print(f"Loading reviews from {input_file}...")
+    df = pd.read_csv(input_file)
+    missing_cols = REQUIRED_COLUMNS - set(df.columns)
+    if missing_cols:
+        raise SystemExit(f"Input CSV is missing required columns: {sorted(missing_cols)}")
+
+    if row_limit is not None:
+        df = df.head(row_limit)
+        print(f"  → Test mode: limited to first {row_limit} reviews.")
+
     print(f"  → {len(df)} reviews loaded.")
 
-    # ── TESTING MODE: uncomment the next line to test with 10 reviews only ──
-    # df = df.head(50)  # REMOVE AFTER TESTING
-
     # ── Phase 2: Resume from checkpoint if a previous run was interrupted ─────
-    # already_done tracks review_ids we've classified so we can skip them this run
-    already_done: set[str] = set()
+    # already_done tracks (app_name, review_id) so different apps can reuse ids safely
+    input_keys = set(review_keys(df))
+    already_done: set[tuple[str, str]] = set()
     results: list[dict[str, Any]] = []
-    if os.path.exists(CHECKPOINT_FILE):
-        done_df = pd.read_csv(CHECKPOINT_FILE)
-        already_done = set(done_df["review_id"].astype(str))
-        # Pre-fill results with the already-classified rows so the final CSV is complete
+    if os.path.exists(checkpoint_file):
+        done_df = pd.read_csv(checkpoint_file)
+        missing_checkpoint_cols = REQUIRED_COLUMNS - set(done_df.columns)
+        if missing_checkpoint_cols:
+            print(f"  → Ignoring checkpoint with missing columns: {sorted(missing_checkpoint_cols)}")
+            done_df = pd.DataFrame(columns=df.columns)
+
+        checkpoint_keys = review_keys(done_df) if len(done_df) else pd.Series(dtype=object)
+        done_df = done_df[checkpoint_keys.isin(input_keys)]
+        already_done = set(review_keys(done_df)) if len(done_df) else set()
+        # Pre-fill only rows that belong to this input file, not an older app run
         results = done_df.to_dict("records")
-        print(f"  → Resuming: {len(already_done)} reviews already classified.")
+        print(f"  → Resuming: {len(already_done)} matching reviews already classified.")
 
     # ── Phase 3: Classify only the reviews not yet in the checkpoint ──────────
-    # The ~ operator inverts the boolean mask — keeps rows whose id is NOT in already_done
-    to_process = df[~df["review_id"].astype(str).isin(already_done)]
+    # The ~ operator inverts the boolean mask — keeps rows whose app+id are NOT in already_done
+    to_process = df[~review_keys(df).isin(already_done)]
     print(f"  → {len(to_process)} reviews left to classify.\n")
 
     for i, row in enumerate(tqdm(to_process.itertuples(), total=len(to_process), desc="Classifying")):
@@ -306,7 +351,7 @@ def main() -> None:
         # Periodic checkpoint — if the script dies at review 237, the next run starts at 201
         # (the last multiple of 50), losing at most CHECKPOINT_EVERY reviews of work
         if (i + 1) % CHECKPOINT_EVERY == 0:
-            pd.DataFrame(results).to_csv(CHECKPOINT_FILE, index=False)
+            pd.DataFrame(results).to_csv(checkpoint_file, index=False)
             tqdm.write(f"  ✓ Checkpoint saved at {len(results)} reviews.")
 
         # Small fixed delay to stay well within Anthropic's rate limit for Haiku
@@ -315,15 +360,15 @@ def main() -> None:
     # ── Phase 4: Write the final CSV with UTF-8-sig encoding ──────────────────
     # utf-8-sig adds a BOM character so Excel opens the CSV without garbling special characters
     final_df = pd.DataFrame(results)
-    final_df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
-    print(f"\n✅ Done! Output saved to: {OUTPUT_FILE}")
+    final_df.to_csv(output_file, index=False, encoding="utf-8-sig")
+    print(f"\n✅ Done! Output saved to: {output_file}")
 
     # ── Phase 5: Print a distribution summary for a quick sanity check ────────
     # If one category dominates (e.g. 95% FUNCTIONAL), something went wrong with the prompt
     print("\n─── CLASSIFICATION SUMMARY ───────────────────────────────")
     print(f"Total reviews classified  : {len(final_df)}")
-    print(f"Errors                    : {(final_df['error'] != '').sum()}")
-    print(f"Validation warnings       : {(final_df['validation_warnings'] != '').sum()}")
+    print(f"Errors                    : {count_real_values(final_df['error'])}")
+    print(f"Validation warnings       : {count_real_values(final_df['validation_warnings'])}")
     print("\nRequirement Type distribution:")
     print(final_df["llm_type"].value_counts().to_string())
     print("\nEmotional Need distribution (EXPERIENCE reviews only):")
